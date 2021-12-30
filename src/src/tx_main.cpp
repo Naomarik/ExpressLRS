@@ -138,10 +138,11 @@ device_affinity_t ui_devices[] = {
 #define DYNAMIC_POWER_MIN_RECORD_NUM       5 // average at least this number of records
 #define DYNAMIC_POWER_BOOST_LQ_THRESHOLD  20 // If LQ is dropped suddenly for this amount (relative), immediately boost to the max power configured.
 #define DYNAMIC_POWER_BOOST_LQ_MIN        50 // If LQ is below this value (absolute), immediately boost to the max power configured.
-#define DYNAMIC_POWER_MOVING_AVG_K         8 // Number of previous values for calculating moving average. Best with power of 2.
+#define DYNAMIC_POWER_MOVING_AVG_K         4 // Number of previous values for calculating moving average. Best with power of 2.
 static int32_t dynamic_power_rssi_sum;
 static int32_t dynamic_power_rssi_n;
 static int32_t dynamic_power_avg_lq;
+static int32_t last_rssi;
 static bool dynamic_power_updated;
 
 #ifdef TARGET_TX_GHOST
@@ -191,9 +192,10 @@ void DynamicPower_Update()
   // Quick boost up of power when detected any emergency LQ drops.
   // It should be useful for bando or sudden lost of LoS cases.
   int32_t lq_current = crsf.LinkStatistics.uplink_Link_quality;
-  int32_t lq_diff = (dynamic_power_avg_lq>>16) - lq_current;
+  int32_t dyn_avg_lq = (dynamic_power_avg_lq>>16);
+  int32_t lq_diff = dyn_avg_lq - lq_current;
   // if LQ drops quickly (DYNAMIC_POWER_BOOST_LQ_THRESHOLD) or critically low below DYNAMIC_POWER_BOOST_LQ_MIN, immediately boost to the configured max power.
-  if(lq_diff >= DYNAMIC_POWER_BOOST_LQ_THRESHOLD || lq_current <= DYNAMIC_POWER_BOOST_LQ_MIN)
+  if (lq_diff >= DYNAMIC_POWER_BOOST_LQ_THRESHOLD || lq_current <= DYNAMIC_POWER_BOOST_LQ_MIN)
   {
       POWERMGNT.setPower((PowerLevels_e)config.GetPower());
       // restart the rssi sampling after a boost up
@@ -203,22 +205,40 @@ void DynamicPower_Update()
   // Moving average calculation, multiplied by 2^16 for avoiding (costly) floating point operation, while maintaining some fraction parts.
   dynamic_power_avg_lq = ((int32_t)(DYNAMIC_POWER_MOVING_AVG_K - 1) * dynamic_power_avg_lq + (lq_current<<16)) / DYNAMIC_POWER_MOVING_AVG_K;
 
-  // =============  RSSI-based power adjustment ==============
-  // It is working slowly, suitable for a general long-range flights.
-
   // Get the RSSI from the selected antenna.
   int8_t rssi = (crsf.LinkStatistics.active_antenna == 0)? crsf.LinkStatistics.uplink_RSSI_1: crsf.LinkStatistics.uplink_RSSI_2;
+
 
   dynamic_power_rssi_sum += rssi;
   dynamic_power_rssi_n++;
 
+  // If average LQ drops below 95, boost.
+  if (dyn_avg_lq < 95)
+    {
+      POWERMGNT.incPower();
+      dynamic_power_avg_lq = 100<<16; // assume we good.
+      dynamic_power_rssi_sum = 0;
+      dynamic_power_rssi_n = 0;
+      last_rssi = rssi;
+
+      return;
+    }
+
+  // =============  RSSI-based power adjustment ==============
+  // It is working slowly, suitable for a general long-range flights.
   // Dynamic power needs at least DYNAMIC_POWER_MIN_RECORD_NUM amount of telemetry records to update.
-  if(dynamic_power_rssi_n < DYNAMIC_POWER_MIN_RECORD_NUM)
+
+  if (dynamic_power_rssi_n < DYNAMIC_POWER_MIN_RECORD_NUM)
     return;
 
   int32_t avg_rssi = dynamic_power_rssi_sum / dynamic_power_rssi_n;
-  int32_t expected_RXsensitivity = ExpressLRS_currAirRate_RFperfParams->RXsensitivity;
 
+  // If average rssi pass a certain threshold from last LQ drop, decrease power by one.
+  if (avg_rssi > (last_rssi + 5)) {
+    POWERMGNT.decPower();
+  }
+
+  int32_t expected_RXsensitivity = ExpressLRS_currAirRate_RFperfParams->RXsensitivity;
   int32_t rssi_inc_threshold = expected_RXsensitivity + DYNPOWER_THRESH_UP;
   int32_t rssi_dec_threshold = expected_RXsensitivity + DYNPOWER_THRESH_DN;
 
@@ -227,6 +247,7 @@ void DynamicPower_Update()
     DBGLN("Power increase");
     POWERMGNT.incPower();
   }
+
   if (avg_rssi > rssi_dec_threshold) {
     DBGVLN("Power decrease");
     POWERMGNT.decPower();
@@ -785,7 +806,7 @@ void OnPowerSetCalibration(mspPacket_t *packet)
   uint8_t index = packet->readByte();
   int8_t value = packet->readByte();
 
-  if((index < 0) || (index > PWR_COUNT))
+  if ((index < 0) || (index > PWR_COUNT))
   {
     DBGLN("calibration error index %d out of range", index);
     return;
