@@ -139,10 +139,11 @@ device_affinity_t ui_devices[] = {
 #define DYNAMIC_POWER_BOOST_LQ_THRESHOLD  20 // If LQ is dropped suddenly for this amount (relative), immediately boost to the max power configured.
 #define DYNAMIC_POWER_BOOST_LQ_MIN        50 // If LQ is below this value (absolute), immediately boost to the max power configured.
 #define DYNAMIC_POWER_MOVING_AVG_K         4 // Number of previous values for calculating moving average. Best with power of 2.
-static int32_t dynamic_power_rssi_sum;
-static int32_t dynamic_power_rssi_n;
-static int32_t dynamic_power_avg_lq;
-static int32_t last_rssi;
+// static int32_t dynamic_power_rssi_sum;
+// static int32_t dynamic_power_rssi_n;
+static int32_t dynamic_power_avg_lq_16;
+static int32_t rssi_avg_16;
+static int32_t last_bad_moving_rssi_avg;
 static bool dynamic_power_updated;
 
 #ifdef TARGET_TX_GHOST
@@ -188,73 +189,53 @@ void DynamicPower_Update()
     return;
   dynamic_power_updated = false;
 
+  // Get the RSSI from the selected antenna.
+  int8_t rssi = (crsf.LinkStatistics.active_antenna == 0)? crsf.LinkStatistics.uplink_RSSI_1: crsf.LinkStatistics.uplink_RSSI_2;
+  int32_t lq_current = crsf.LinkStatistics.uplink_Link_quality;
+  int32_t moving_dyn_avg_lq = (dynamic_power_avg_lq_16>>16);
+  int32_t moving_rssi_avg = (rssi_avg_16>>16);
+  int32_t lq_diff = moving_dyn_avg_lq - lq_current;
+
+  // Moving average calculation, multiplied by 2^16 for avoiding (costly) floating point operation, while maintaining some fraction parts.
+  rssi_avg_16 = ((int32_t)(DYNAMIC_POWER_MOVING_AVG_K - 1) * rssi_avg_16 + (rssi<<16)) / DYNAMIC_POWER_MOVING_AVG_K;
+  dynamic_power_avg_lq_16 = ((int32_t)(DYNAMIC_POWER_MOVING_AVG_K - 1) * dynamic_power_avg_lq_16 + (lq_current<<16)) / DYNAMIC_POWER_MOVING_AVG_K;
+
   // =============  LQ-based power boost up ==============
   // Quick boost up of power when detected any emergency LQ drops.
   // It should be useful for bando or sudden lost of LoS cases.
-  int32_t lq_current = crsf.LinkStatistics.uplink_Link_quality;
-  int32_t dyn_avg_lq = (dynamic_power_avg_lq>>16);
-  int32_t lq_diff = dyn_avg_lq - lq_current;
+
   // if LQ drops quickly (DYNAMIC_POWER_BOOST_LQ_THRESHOLD) or critically low below DYNAMIC_POWER_BOOST_LQ_MIN, immediately boost to the configured max power.
   if (lq_diff >= DYNAMIC_POWER_BOOST_LQ_THRESHOLD || lq_current <= DYNAMIC_POWER_BOOST_LQ_MIN)
   {
       POWERMGNT.setPower((PowerLevels_e)config.GetPower());
-      // restart the rssi sampling after a boost up
-      dynamic_power_rssi_sum = 0;
-      dynamic_power_rssi_n = 0;
+      dynamic_power_avg_lq_16 = 100<<16; // assume we good.
+
+      return;
   }
-  // Moving average calculation, multiplied by 2^16 for avoiding (costly) floating point operation, while maintaining some fraction parts.
-  dynamic_power_avg_lq = ((int32_t)(DYNAMIC_POWER_MOVING_AVG_K - 1) * dynamic_power_avg_lq + (lq_current<<16)) / DYNAMIC_POWER_MOVING_AVG_K;
-
-  // Get the RSSI from the selected antenna.
-  int8_t rssi = (crsf.LinkStatistics.active_antenna == 0)? crsf.LinkStatistics.uplink_RSSI_1: crsf.LinkStatistics.uplink_RSSI_2;
 
 
-  dynamic_power_rssi_sum += rssi;
-  dynamic_power_rssi_n++;
-
-  // If average LQ drops below 95, boost.
-  if (dyn_avg_lq < 95)
+  // If average LQ drops below 97, boost.
+  if (moving_dyn_avg_lq < 97)
     {
-      POWERMGNT.incPower();
-      dynamic_power_avg_lq = 100<<16; // assume we good.
-      dynamic_power_rssi_sum = 0;
-      dynamic_power_rssi_n = 0;
-      last_rssi = rssi;
+      POWERMGNT.incPower(); // this actually doesn't seem to respect max configured power, will go all the way up
+      dynamic_power_avg_lq_16 = 100<<16; // assume we good.
+      last_bad_moving_rssi_avg = moving_rssi_avg;
 
       return;
     }
 
-  // =============  RSSI-based power adjustment ==============
-  // It is working slowly, suitable for a general long-range flights.
-  // Dynamic power needs at least DYNAMIC_POWER_MIN_RECORD_NUM amount of telemetry records to update.
-
-  if (dynamic_power_rssi_n < DYNAMIC_POWER_MIN_RECORD_NUM)
-    return;
-
-  int32_t avg_rssi = dynamic_power_rssi_sum / dynamic_power_rssi_n;
-
-  // If average rssi pass a certain threshold from last LQ drop, decrease power by one.
-  if (avg_rssi > (last_rssi + 5)) {
+  if (moving_rssi_avg > (last_bad_moving_rssi_avg + 8)) {
     POWERMGNT.decPower();
   }
 
   int32_t expected_RXsensitivity = ExpressLRS_currAirRate_RFperfParams->RXsensitivity;
-  int32_t rssi_inc_threshold = expected_RXsensitivity + DYNPOWER_THRESH_UP;
-  int32_t rssi_dec_threshold = expected_RXsensitivity + DYNPOWER_THRESH_DN;
+  int32_t rssi_dec_threshold = expected_RXsensitivity + 50; // decrease when we have much better signal
 
-  // increase power only up to the set power from the LUA script
-  if (avg_rssi < rssi_inc_threshold && POWERMGNT.currPower() < (PowerLevels_e)config.GetPower()) {
-    DBGLN("Power increase");
-    POWERMGNT.incPower();
-  }
-
-  if (avg_rssi > rssi_dec_threshold) {
+  // decrease to minimum when we're near ourselves
+  if (moving_rssi_avg > rssi_dec_threshold) {
     DBGVLN("Power decrease");
     POWERMGNT.decPower();
   }
-
-  dynamic_power_rssi_sum = 0;
-  dynamic_power_rssi_n = 0;
 }
 
 void ICACHE_RAM_ATTR ProcessTLMpacket()
